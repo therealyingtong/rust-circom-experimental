@@ -437,13 +437,10 @@ where
                                     if *xtype == SignalType::PublicInput
                                         || *xtype == SignalType::PrivateInput
                                     {
-                                        // AMB
-                                        //if self.mode == Mode::GenWitness {
                                         if !(component_name == "main" && self.mode == Mode::GenConstraints) {
                                             all_pending_input_signals
                                                 .append(&mut pending_signals);
                                         }
-                                        //}
                                     }
                                 }
 
@@ -1112,32 +1109,28 @@ where
                         )));
                     }
 
-                    // check for lazy component execution
-                    //AMB 
-                    //if self.mode == Mode::GenWitness {
-                        if let Some(component_name) = self.signal_component(scope, signal)? {
-                            let needs_expansion =
-                                scope.get_mut(&component_name, |var| match var {
-                                    Some(ScopeValue::Component { pending_inputs, .. }) => {
-                                        if pending_inputs.len() > 0 {
-                                            pending_inputs.retain(|s| *s != signal_id);
-                                            pending_inputs.len() == 0
-                                        } else {
-                                            false
-                                        }
+                    if let Some(component_name) = self.signal_component(scope, signal)? {
+                        let needs_expansion =
+                            scope.get_mut(&component_name, |var| match var {
+                                Some(ScopeValue::Component { pending_inputs, .. }) => {
+                                    if pending_inputs.len() > 0 {
+                                        pending_inputs.retain(|s| *s != signal_id);
+                                        pending_inputs.len() == 0
+                                    } else {
+                                        false
                                     }
-                                    _ => panic!(
-                                        "signal not found '{}' in scope {:?}",
-                                        signal.name, meta
-                                    ),
-                                });
-                            // if all input signals has been set, then expand the component
-                            if needs_expansion {
-                                self.trace(meta,|| format!("eval_signal_left_lazy_eval {}",component_name));
-                                self.eval_component_expand(meta, scope, &component_name)?;
-                            }
+                                }
+                                _ => panic!(
+                                    "signal not found '{}' in scope {:?}",
+                                    signal.name, meta
+                                ),
+                            });
+                        // if all input signals has been set, then expand the component
+                        if needs_expansion {
+                            self.trace(meta,|| format!("eval_signal_left_lazy_eval {}",component_name));
+                            self.eval_component_expand(meta, scope, &component_name)?;
                         }
-                    //}
+                    }
                 } else {
                     return Err(Error::NotFound(format!("Signal {}", signal_full)));
                 }
@@ -1172,9 +1165,9 @@ where
         signal: &VariableP,
     ) -> Result<()> {
         self.trace(meta,|| format!("eval_signal_right {:?}",signal));
-        //if self.mode.skip_eval(&meta) {
-        //    return Ok(());
-        //}
+        if self.mode.skip_eval(&meta) {
+            return Ok(());
+        }
         let mut internal = || {
             use Opcode::*;
             match op {

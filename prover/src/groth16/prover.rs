@@ -1,8 +1,7 @@
-use circom2_compiler::algebra::{Value, FS, LC};
+use circom2_compiler::algebra::FS;
 use circom2_compiler::evaluator::{Evaluator,check_constrains_eval_zero};
 use circom2_compiler::storage;
-use circom2_compiler::storage::{Constraints, Signals};
-use circom2_parser::ast::SignalType;
+use circom2_compiler::storage::{Constraints, Signals,count_public_inputs,is_public_input};
 
 use std::io::{Read, Write};
 use std::marker::PhantomData;
@@ -10,9 +9,9 @@ use std::marker::PhantomData;
 use pairing::bn256::{Bn256, Fr};
 use pairing::Engine;
 
-use bellman::{Circuit, ConstraintSystem, LinearCombination, SynthesisError};
+use bellman::{Circuit, ConstraintSystem, SynthesisError};
 use bellman::groth16::{
-    create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof, Proof,
+    create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof
 };
 
 use ff::PrimeField;
@@ -20,6 +19,7 @@ use ff::PrimeField;
 use rand::thread_rng;
 
 use super::error::Result;
+use super::format::*;
 use super::ethereum;
 use super::format;
 
@@ -31,28 +31,6 @@ pub struct CircomCircuit<'a, E: Engine> {
 
 impl<'a, E: Engine> CircomCircuit<'a, E> {}
 
-fn value_to_bellman<E: Engine>(value: &Value) -> E::Fr {
-    match value {
-        Value::FieldScalar(fs) => fe_to_bellman::<E>(fs),
-        _ => panic!("Invalid signal value"),
-    }
-}
-
-fn fe_to_bellman<E: Engine>(fe: &FS) -> E::Fr {
-    E::Fr::from_str(&fe.0.to_str_radix(10)).unwrap()
-}
-
-fn lc_to_bellman<E: Engine>(
-    mut base: LinearCombination<E>,
-    signals: &[bellman::Variable],
-    lc: &LC,
-) -> LinearCombination<E> {
-    use std::ops::Add;
-    for (s, v) in &lc.0 {
-        base = base.add((fe_to_bellman::<E>(&v), signals[*s]));
-    }
-    base
-}
 
 fn map_storage_error<V>(
     e: std::result::Result<V, storage::Error>,
@@ -61,12 +39,6 @@ fn map_storage_error<V>(
         Ok(v) => Ok(v),
         _ => Err(SynthesisError::Unsatisfiable),
     }
-}
-
-fn is_public_input(signal: &circom2_compiler::storage::Signal) -> bool {
-    let component_len = signal.full_name.0.chars().filter(|ch| *ch == '.').count();
-    component_len == 1
-        && (signal.xtype == SignalType::Output || signal.xtype == SignalType::PublicInput)
 }
 
 impl<'a, E: Engine> Circuit<E> for CircomCircuit<'a, E> {
@@ -86,7 +58,7 @@ impl<'a, E: Engine> Circuit<E> for CircomCircuit<'a, E> {
                     || {
                         s.value
                             .clone()
-                            .map(|vv| value_to_bellman::<E>(&vv))
+                            .map(|vv| value_to_bellman_fr::<E>(&vv))
                             .ok_or(SynthesisError::AssignmentMissing)
                     },
                 )?
@@ -96,7 +68,7 @@ impl<'a, E: Engine> Circuit<E> for CircomCircuit<'a, E> {
                     || {
                         s.value
                             .clone()
-                            .map(|vv| value_to_bellman::<E>(&vv))
+                            .map(|vv| value_to_bellman_fr::<E>(&vv))
                             .ok_or(SynthesisError::AssignmentMissing)
                     },
                 )?
@@ -133,14 +105,15 @@ pub fn setup<S: Signals, C: Constraints, WP: Write, WV: Write>(
 
     // perform setup
     let params = generate_random_parameters(circuit, rng)?;
-
     format::write_pk(out_pk, &eval.constraints, &params)?;
-    ethereum::generate_solidity(&params.vk, &mut out_vk)?;
+    
+    let inputs_len = count_public_inputs(&eval.signals)?; 
+    ethereum::generate_solidity(&params.vk,inputs_len, &mut out_vk)?;
 
     Ok(())
 }
 
-pub fn proof<S: Signals, R: Read, W: Write>(
+pub fn generate_verified_proof<S: Signals, R: Read, W: Write>(
     signals: S,
     in_pk: R,
     out_proof: &mut W
@@ -161,7 +134,6 @@ pub fn proof<S: Signals, R: Read, W: Write>(
 
     // Create proof
     let proof = create_random_proof(circuit, &params, rng).expect("cannot create proof");
-    format::write_proof(proof, out_proof)?;
 
     let mut public_inputs = Vec::new();
     for i in 0..signals.len()? {
@@ -173,26 +145,18 @@ pub fn proof<S: Signals, R: Read, W: Write>(
         }
     }
 
-    Ok(public_inputs)
-}
-
-pub fn verify<RPK: Read, RPR: Read>(
-    in_pk: RPK,
-    in_proof: RPR,
-    in_public_input: &Vec<FS>,
-) -> Result<bool> {
-    let proof: Proof<Bn256> = format::read_proof(in_proof)?;
-
-    let (_, params) = format::read_pk(in_pk)?;
+    // Self-verify
     let vk = prepare_verifying_key(&params.vk);
-
-    let in_public_input = in_public_input
-        .into_iter()
-        .map(|n| Fr::from_str(&n.0.to_string())
-            .expect("cannot parse fe"))
+    let verify_public_inputs = public_inputs
+        .iter()
+        .map(|(_,n)| Fr::from_str(&(n.0.to_string()))
+            .expect(&format!("cannot parse fe {}",&n.0.to_string())))
         .collect::<Vec<_>>();
 
-    Ok(verify_proof(&vk, &proof, &in_public_input)?)
+    verify_proof(&vk, &proof, &verify_public_inputs)?;
+    format::write_input_and_proof(public_inputs.clone(), proof, out_proof)?;
+
+    Ok(public_inputs)
 }
 
 #[cfg(test)]
@@ -202,6 +166,7 @@ mod test {
     use bellman::groth16::{
         create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof,
     };
+    use circom2_compiler::algebra::Value;
     use circom2_compiler::evaluator::{Evaluator, Mode, Scope};
     use circom2_compiler::storage::Ram;
     use circom2_compiler::storage::StorageFactory;
@@ -344,28 +309,12 @@ mod test {
         check_constrains_eval_zero(&ev_r1cs.constraints,&ev_witness.signals)
             .expect("cannot check all constraints = 0");
 
-        // Create proof
+        // Create and verify proof
         let mut proof_out = Vec::new();
         let pk = File::open("/tmp/pk").unwrap();
-        let public_input = proof(ev_witness.signals, pk, &mut proof_out).unwrap();
+        let public_input = generate_verified_proof(ev_witness.signals, pk, &mut proof_out).unwrap();
         assert_eq!("[(\"main.c\", 21)]", format!("{:?}", public_input));
 
-        // Verify with valid public input
-        let public_input_values = public_input.into_iter().map(|(_,v)| v).collect::<Vec<_>>();
-        let pk = File::open("/tmp/pk").unwrap();
-        assert_eq!(
-            verify(pk, proof_out.as_slice(), &public_input_values)
-            .expect("cannot verify proof1"),
-            true
-        );
-
-        // Verify with invalid public input
-        let pk = File::open("/tmp/pk").unwrap();
-        assert_eq!(
-            verify(pk, proof_out.as_slice(), &vec![FS::from(22)])
-            .expect("cannot verify proof2"),
-            false
-        );
     }
 
 }

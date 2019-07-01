@@ -157,43 +157,21 @@ fn prove_ram(circuit_path: &str,proving_key_path: &str, input_path: &str, proof_
         .expect("cannot evaluate circuit");
 
     // Create proof
-    info!("Creating proof...");
+    info!("Creating and self-verifying proof...");
     let pk = File::open(proving_key_path)
         .expect("cannot read proving key");
 
     let mut proof = File::create(proof_path)
         .expect("cannot create proof file");
 
-    let public_input = circom2_prover::groth16::proof(
+    let _ = circom2_prover::groth16::generate_verified_proof(
         ev_witness.signals,
         pk,
         &mut proof
-    ).expect("cannot generate proof");
+    ).expect("cannot generate and self-verify proof");
+
+    info!("Done.");
         
-    for (signal,value) in &public_input {
-        println!("INPUT {} {}",signal, value.0.to_str_radix(10));
-    }
-
-    // Verify proof
-    info!("Verifying proof...");
-
-    let pk = File::open(proving_key_path)
-        .expect("cannot read proving key");
-    let proof = File::open(proof_path)
-        .expect("cannot read proof file");
-    
-    let public_input_values = public_input.into_iter().map(|(_,v)| v).collect::<Vec<_>>();
-
-    let ok = circom2_prover::groth16::verify(
-        pk,
-        proof,
-        &public_input_values
-    ).expect("cannot verify proof");
-
-    if !ok {
-        panic!("proof verification failed");
-    }
-
 }
 
 use structopt::StructOpt;

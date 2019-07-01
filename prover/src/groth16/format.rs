@@ -3,28 +3,28 @@ extern crate rand;
 use pairing::bn256::Bn256;
 use regex::Regex;
 
-use circom2_compiler::algebra::{FS,QEQ};
+use circom2_compiler::algebra::{Value, FS, LC, QEQ};
+use circom2_compiler::storage::Constraints;
 use circom2_compiler::storage::Ram;
 use circom2_compiler::storage::RamConstraints;
 use circom2_compiler::storage::StorageFactory;
-use circom2_compiler::storage::{Constraints};
+
+use bellman::LinearCombination;
 
 use std::io::{Read, Write};
 
-use bellman::groth16::{Proof,Parameters};
+use bellman::groth16::{Parameters, Proof};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use ff::PrimeField;
+use pairing::Engine;
 
+use error::{Error, Result};
 use serde_cbor::{from_slice, to_vec};
-use error::{Error,Result};
 
 use super::error;
 
 #[derive(Serialize, Deserialize)]
-struct JsonProof {
-    a : Vec<String>,
-    b : Vec<Vec<String>>,
-    c : Vec<String>,
-}
+struct JsonInputAndProof([String; 2],[[String; 2]; 2],[String; 2],Vec<String>);
 
 /*
 Taken from Thibaut Schaeffer's ZoKrates
@@ -82,83 +82,88 @@ pub fn parse_g2_hex(e: &<Bn256 as bellman::pairing::Engine>::G2Affine) -> String
     format!("[{}, {}], [{}, {}]", parsed.0, parsed.1, parsed.2, parsed.3,)
 }
 
-pub fn flatten_json(prefix: &str, json :&str) -> Result<Vec<(String,FS)>> {
-    fn flatten(prefix: &str, v:& serde_json::Value, result : &mut Vec<(String,FS)>) -> Result<()> {
+pub fn flatten_json(prefix: &str, json: &str) -> Result<Vec<(String, FS)>> {
+    fn flatten(prefix: &str, v: &serde_json::Value, result: &mut Vec<(String, FS)>) -> Result<()> {
         match v {
             serde_json::Value::Array(values) => {
-                for (i,value) in values.iter().enumerate() {
-                    flatten(&format!("{}[{}]",prefix,i),value,result)?;
+                for (i, value) in values.iter().enumerate() {
+                    flatten(&format!("{}[{}]", prefix, i), value, result)?;
                 }
                 Ok(())
             }
             serde_json::Value::Object(values) => {
-                for (key,value) in values.iter() {
-                    flatten(&format!("{}.{}",prefix,key),value,result)?;
+                for (key, value) in values.iter() {
+                    flatten(&format!("{}.{}", prefix, key), value, result)?;
                 }
                 Ok(())
             }
             serde_json::Value::String(value) => {
-                result.push((prefix.to_string(),FS::parse(value)?));
+                result.push((prefix.to_string(), FS::parse(value)?));
                 Ok(())
             }
             serde_json::Value::Number(value) => {
-                let value = value.as_u64()
-                    .ok_or_else(|| Error::Unexpected(format!("bad value {:?}",value)))?;
-                result.push((prefix.to_string(),FS::from(value)));
+                let value = value
+                    .as_u64()
+                    .ok_or_else(|| Error::Unexpected(format!("bad value {:?}", value)))?;
+                result.push((prefix.to_string(), FS::from(value)));
                 Ok(())
             }
-            _ => Err(Error::Unexpected(format!("Cannot decode value {:?}",v)))         
+            _ => Err(Error::Unexpected(format!("Cannot decode value {:?}", v))),
         }
     }
 
-    let json : serde_json::Value = serde_json::from_str(json)?;
+    let json: serde_json::Value = serde_json::from_str(json)?;
 
     let mut result = Vec::new();
-    flatten(prefix,&json,&mut result)?;
+    flatten(prefix, &json, &mut result)?;
     Ok(result)
 }
 
-pub fn write_proof<W:Write>(proof : Proof<Bn256>, out: &mut W) -> Result<()> {
-    Ok(proof.write(out)?)
-    /*
+pub fn value_to_bellman_fr<E: Engine>(value: &Value) -> E::Fr {
+    match value {
+        Value::FieldScalar(fs) => fe_to_bellman_fr::<E>(fs),
+        _ => panic!("Invalid signal value"),
+    }
+}
+
+pub fn fe_to_bellman_fr<E: Engine>(fe: &FS) -> E::Fr {
+    E::Fr::from_str(&fe.0.to_str_radix(10)).unwrap()
+}
+
+pub fn lc_to_bellman<E: Engine>(
+    mut base: LinearCombination<E>,
+    signals: &[bellman::Variable],
+    lc: &LC,
+) -> LinearCombination<E> {
+    use std::ops::Add;
+    for (s, v) in &lc.0 {
+        base = base.add((fe_to_bellman_fr::<E>(&v), signals[*s]));
+    }
+    base
+}
+
+pub fn write_input_and_proof<W: Write>(
+    public_input: Vec<(String, FS)>,
+    proof: Proof<Bn256>,
+    out: &mut W,
+) -> Result<()> {
     let a = parse_g1(&proof.a);
     let b = parse_g2(&proof.b);
     let c = parse_g1(&proof.c);
 
-    let json = serde_json::to_string(&JsonProof {
-        a: vec![a.0,a.1],
-        b: vec![vec![b.0,b.1],vec![b.2,b.3]],
-        c: vec![c.0,c.1],
-    })?;
+    let json = serde_json::to_string(&JsonInputAndProof(
+        [a.0, a.1],
+        [[b.0, b.1], [b.2, b.3]],
+        [c.0, c.1],
+        public_input
+            .into_iter()
+            .map(|(_, v)| v.0.to_string())
+            .collect::<Vec<_>>(),
+    ))?;
 
     out.write(json.as_bytes())?;
     Ok(())
-    */
 }
-
-pub fn read_proof<R:Read>(reader: R) -> Result<Proof<Bn256>> {
-    let proof : Proof<Bn256> = Proof::read(reader)?;
-    Ok(proof)
-
-/*
-    let proof: JsonProof = serde_json::from_reader(reader)?;
-    bn256::Bn256::G1Affine
-    
-    let a = parse_g1(&proof.a);
-    let b = parse_g2(&proof.b);
-    let c = parse_g1(&proof.c);
-
-    let json = serde_json::to_string(&JsonProof {
-        a: vec![a.0,a.1],
-        b: vec![vec![b.0,b.1],vec![b.2,b.3]],
-        c: vec![c.0,c.1],
-    })?;
-
-    out.write(json.as_bytes())?;
-    Ok(())
-*/
-}
-
 
 pub fn write_pk<W: Write, C: Constraints>(
     mut pk: W,
@@ -172,7 +177,7 @@ pub fn write_pk<W: Write, C: Constraints>(
         pk.write_u32::<BigEndian>(qeq.len() as u32)?;
         pk.write(&qeq)?;
     }
-    
+
     params.write(pk)?;
     Ok(())
 }
@@ -190,7 +195,7 @@ pub fn read_pk<R: Read>(mut pk: R) -> Result<(RamConstraints, Parameters<Bn256>)
         buffer.resize(len, 0u8);
         pk.read_exact(&mut buffer)?;
         let qeq = from_slice::<QEQ>(&buffer)?;
-        constraints.push(qeq,None)?;
+        constraints.push(qeq, None)?;
     }
 
     let params: Parameters<Bn256> = Parameters::read(pk, true)?;
